@@ -1,6 +1,28 @@
 ﻿using UnityEngine;
 using System.Collections.Generic;
 
+/// <summary>
+/// Interactive Content-Aware Image Resizer using Seam Carving
+/// 
+/// Features:
+/// - Interactive mouse-based scaling with scroll wheel
+/// - X/Y axis specific scaling (hold X or Y keys)  
+/// - Real-time seam visualization
+/// - Batch resize functionality
+/// - Reset to original dimensions
+/// 
+/// Usage:
+/// 1. Assign source texture and output renderer
+/// 2. Enable interactive mode
+/// 3. Click and drag to move, scroll to scale
+/// 4. Hold X for X-axis only, Y for Y-axis only
+/// 5. Press S or use GUI to toggle seam display
+/// 
+/// Requirements:
+/// - GameObject must have a Collider for interaction
+/// - Source texture must have "Read/Write Enabled"
+/// - Scene needs a MainCamera for mouse interaction
+/// </summary>
 public class ContentAwareResizer : MonoBehaviour
 {
     public Texture2D sourceTexture;
@@ -16,7 +38,7 @@ public class ContentAwareResizer : MonoBehaviour
     private Camera mainCamera;
     private bool isSelected = false;
     private Vector3 offset;
-    private Texture2D currentProcessedTexture;
+    public Texture2D currentProcessedTexture;  // Made public for demo access
     private int[] lastVerticalSeam;
     private int[] lastHorizontalSeam;
 
