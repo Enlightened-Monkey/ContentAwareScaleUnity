@@ -7,6 +7,270 @@ public class ContentAwareResizer : MonoBehaviour
     public int targetWidth;
     public int targetHeight;
     public Renderer outputRenderer;
+    
+    [Header("Interactive Controls")]
+    public bool enableInteractiveMode = true;
+    public bool showSeams = false;
+    public Color seamColor = Color.red;
+    
+    private Camera mainCamera;
+    private bool isSelected = false;
+    private Vector3 offset;
+    private Texture2D currentProcessedTexture;
+    private int[] lastVerticalSeam;
+    private int[] lastHorizontalSeam;
+
+    void Start()
+    {
+        mainCamera = Camera.main;
+        if (sourceTexture != null)
+        {
+            currentProcessedTexture = CreateReadableTextureCopy(sourceTexture);
+        }
+    }
+    
+    void Update()
+    {
+        if (enableInteractiveMode)
+        {
+            HandleInteractiveMode();
+        }
+    }
+    
+    private void HandleInteractiveMode()
+    {
+        // Handle mouse selection
+        if (Input.GetMouseButtonDown(0))
+        {
+            Ray ray = mainCamera.ScreenPointToRay(Input.mousePosition);
+            RaycastHit hit;
+            
+            if (Physics.Raycast(ray, out hit) && hit.collider.gameObject == gameObject)
+            {
+                isSelected = true;
+                offset = transform.position - mainCamera.ScreenToWorldPoint(new Vector3(Input.mousePosition.x, Input.mousePosition.y, mainCamera.nearClipPlane));
+            }
+        }
+
+        // Handle dragging
+        if (Input.GetMouseButton(0) && isSelected)
+        {
+            Vector3 mousePosition = mainCamera.ScreenToWorldPoint(new Vector3(Input.mousePosition.x, Input.mousePosition.y, mainCamera.nearClipPlane));
+            transform.position = mousePosition + offset;
+        }
+
+        // Handle scaling with scroll wheel
+        if (isSelected && currentProcessedTexture != null)
+        {
+            float scroll = Input.GetAxis("Mouse ScrollWheel");
+            if (scroll != 0)
+            {
+                ProcessInteractiveScaling(scroll);
+            }
+        }
+
+        // Handle mouse release
+        if (Input.GetMouseButtonUp(0))
+        {
+            isSelected = false;
+        }
+        
+        // Toggle seam display
+        if (Input.GetKeyDown(KeyCode.S))
+        {
+            showSeams = !showSeams;
+            if (showSeams && currentProcessedTexture != null)
+            {
+                ShowSeamVisualization();
+            }
+            else if (currentProcessedTexture != null)
+            {
+                UpdateTexture(currentProcessedTexture);
+            }
+        }
+    }
+    
+    private void ProcessInteractiveScaling(float scroll)
+    {
+        if (currentProcessedTexture == null) return;
+        
+        int width = currentProcessedTexture.width;
+        int height = currentProcessedTexture.height;
+        Color[] pixels = currentProcessedTexture.GetPixels();
+
+        float[,] energyMap = CalculateEnergyMap(pixels, width, height);
+
+        if (!Input.GetKey(KeyCode.X) && !Input.GetKey(KeyCode.Y))
+        {
+            // Uniform scaling: both X and Y
+            ProcessUniformScaling(scroll, energyMap, width, height, pixels);
+        }
+        else if (Input.GetKey(KeyCode.X))
+        {
+            // X-axis only (vertical seams)
+            ProcessVerticalScaling(scroll, energyMap, width, height, pixels);
+        }
+        else if (Input.GetKey(KeyCode.Y))
+        {
+            // Y-axis only (horizontal seams)
+            ProcessHorizontalScaling(scroll, energyMap, width, height, pixels);
+        }
+        
+        if (showSeams)
+        {
+            ShowSeamVisualization();
+        }
+        else
+        {
+            UpdateTexture(currentProcessedTexture);
+        }
+    }
+    
+    private void ProcessUniformScaling(float scroll, float[,] energyMap, int width, int height, Color[] pixels)
+    {
+        if (scroll > 0)
+        {
+            // Enlarge: add seams
+            lastVerticalSeam = FindVerticalSeam(energyMap, width, height);
+            currentProcessedTexture = InsertVerticalSeam(currentProcessedTexture);
+            
+            // Recalculate for horizontal seam
+            width = currentProcessedTexture.width;
+            height = currentProcessedTexture.height;
+            pixels = currentProcessedTexture.GetPixels();
+            energyMap = CalculateEnergyMap(pixels, width, height);
+            
+            lastHorizontalSeam = FindHorizontalSeam(energyMap, width, height);
+            currentProcessedTexture = InsertHorizontalSeam(currentProcessedTexture);
+        }
+        else
+        {
+            // Shrink: remove seams
+            lastVerticalSeam = FindVerticalSeam(energyMap, width, height);
+            currentProcessedTexture = RemoveVerticalSeam(currentProcessedTexture);
+            
+            // Recalculate for horizontal seam
+            width = currentProcessedTexture.width;
+            height = currentProcessedTexture.height;
+            pixels = currentProcessedTexture.GetPixels();
+            energyMap = CalculateEnergyMap(pixels, width, height);
+            
+            lastHorizontalSeam = FindHorizontalSeam(energyMap, width, height);
+            currentProcessedTexture = RemoveHorizontalSeam(currentProcessedTexture);
+        }
+    }
+    
+    private void ProcessVerticalScaling(float scroll, float[,] energyMap, int width, int height, Color[] pixels)
+    {
+        lastVerticalSeam = FindVerticalSeam(energyMap, width, height);
+        
+        if (scroll > 0)
+        {
+            currentProcessedTexture = InsertVerticalSeam(currentProcessedTexture);
+        }
+        else
+        {
+            currentProcessedTexture = RemoveVerticalSeam(currentProcessedTexture);
+        }
+    }
+    
+    private void ProcessHorizontalScaling(float scroll, float[,] energyMap, int width, int height, Color[] pixels)
+    {
+        lastHorizontalSeam = FindHorizontalSeam(energyMap, width, height);
+        
+        if (scroll > 0)
+        {
+            currentProcessedTexture = InsertHorizontalSeam(currentProcessedTexture);
+        }
+        else
+        {
+            currentProcessedTexture = RemoveHorizontalSeam(currentProcessedTexture);
+        }
+    }
+    
+    private void ShowSeamVisualization()
+    {
+        if (currentProcessedTexture == null) return;
+        
+        Texture2D seamTexture = new Texture2D(currentProcessedTexture.width, currentProcessedTexture.height, TextureFormat.RGBA32, false);
+        Color[] pixels = currentProcessedTexture.GetPixels();
+        Color[] seamPixels = new Color[pixels.Length];
+        
+        // Copy original pixels
+        System.Array.Copy(pixels, seamPixels, pixels.Length);
+        
+        // Highlight seams
+        if (lastVerticalSeam != null)
+        {
+            for (int y = 0; y < lastVerticalSeam.Length; y++)
+            {
+                int x = lastVerticalSeam[y];
+                if (x >= 0 && x < currentProcessedTexture.width && y >= 0 && y < currentProcessedTexture.height)
+                {
+                    seamPixels[y * currentProcessedTexture.width + x] = seamColor;
+                }
+            }
+        }
+        
+        if (lastHorizontalSeam != null)
+        {
+            for (int x = 0; x < lastHorizontalSeam.Length; x++)
+            {
+                int y = lastHorizontalSeam[x];
+                if (x >= 0 && x < currentProcessedTexture.width && y >= 0 && y < currentProcessedTexture.height)
+                {
+                    seamPixels[y * currentProcessedTexture.width + x] = seamColor;
+                }
+            }
+        }
+        
+        seamTexture.SetPixels(seamPixels);
+        seamTexture.Apply();
+        
+        UpdateTexture(seamTexture);
+    }
+    
+    private void UpdateTexture(Texture2D texture)
+    {
+        if (outputRenderer != null && texture != null)
+        {
+            outputRenderer.material.mainTexture = texture;
+        }
+    }
+    
+    [ContextMenu("Toggle Seam Display")]
+    public void ToggleSeamDisplay()
+    {
+        showSeams = !showSeams;
+        if (currentProcessedTexture != null)
+        {
+            if (showSeams)
+            {
+                ShowSeamVisualization();
+            }
+            else
+            {
+                UpdateTexture(currentProcessedTexture);
+            }
+        }
+    }
+    
+    void OnGUI()
+    {
+        if (enableInteractiveMode)
+        {
+            // Create a simple button in the top-left corner
+            if (GUI.Button(new Rect(10, 10, 120, 25), showSeams ? "Hide Seams" : "Show Seams"))
+            {
+                ToggleSeamDisplay();
+            }
+            
+            // Display instructions
+            GUI.Label(new Rect(10, 40, 300, 20), "Click and drag to move, scroll to scale");
+            GUI.Label(new Rect(10, 60, 300, 20), "Hold X for X-axis only, Y for Y-axis only");
+            GUI.Label(new Rect(10, 80, 300, 20), "Press S to toggle seam display");
+        }
+    }
 
     /// <summary>
     /// Creates a readable copy of a texture, which is necessary for GetPixels() to work
@@ -56,6 +320,7 @@ public class ContentAwareResizer : MonoBehaviour
 
         // Create a temporary, writable copy of the texture that is guaranteed to be readable.
         Texture2D processedTexture = CreateReadableTextureCopy(sourceTexture);
+        currentProcessedTexture = processedTexture;
 
         int widthDifference = processedTexture.width - targetWidth;
         int heightDifference = processedTexture.height - targetHeight;
@@ -67,7 +332,7 @@ public class ContentAwareResizer : MonoBehaviour
         {
             for (int i = 0; i < widthDifference; i++)
             {
-                processedTexture = RemoveVerticalSeam(processedTexture);
+                currentProcessedTexture = RemoveVerticalSeam(currentProcessedTexture);
                 if (i % 10 == 0) Debug.Log($"Removed vertical seam {i + 1}/{widthDifference}");
             }
         }
@@ -75,7 +340,7 @@ public class ContentAwareResizer : MonoBehaviour
         {
             for (int i = 0; i < -widthDifference; i++)
             {
-                processedTexture = InsertVerticalSeam(processedTexture);
+                currentProcessedTexture = InsertVerticalSeam(currentProcessedTexture);
                 if (i % 10 == 0) Debug.Log($"Inserted vertical seam {i + 1}/{-widthDifference}");
             }
         }
@@ -85,7 +350,7 @@ public class ContentAwareResizer : MonoBehaviour
         {
             for (int i = 0; i < heightDifference; i++)
             {
-                processedTexture = RemoveHorizontalSeam(processedTexture);
+                currentProcessedTexture = RemoveHorizontalSeam(currentProcessedTexture);
                 if (i % 10 == 0) Debug.Log($"Removed horizontal seam {i + 1}/{heightDifference}");
             }
         }
@@ -93,7 +358,7 @@ public class ContentAwareResizer : MonoBehaviour
         {
             for (int i = 0; i < -heightDifference; i++)
             {
-                processedTexture = InsertHorizontalSeam(processedTexture);
+                currentProcessedTexture = InsertHorizontalSeam(currentProcessedTexture);
                 if (i % 10 == 0) Debug.Log($"Inserted horizontal seam {i + 1}/{-heightDifference}");
             }
         }
@@ -101,8 +366,8 @@ public class ContentAwareResizer : MonoBehaviour
         // Display the result
         if (outputRenderer != null)
         {
-            Debug.Log($"Finished resize. Final dimensions: {processedTexture.width}x{processedTexture.height}");
-            outputRenderer.material.mainTexture = processedTexture;
+            Debug.Log($"Finished resize. Final dimensions: {currentProcessedTexture.width}x{currentProcessedTexture.height}");
+            UpdateTexture(currentProcessedTexture);
         }
         else
         {
@@ -117,14 +382,14 @@ public class ContentAwareResizer : MonoBehaviour
         Color[] pixels = texture.GetPixels();
 
         float[,] energyMap = CalculateEnergyMap(pixels, width, height);
-        int[] seam = FindVerticalSeam(energyMap, width, height);
+        lastVerticalSeam = FindVerticalSeam(energyMap, width, height);
 
         Texture2D newTexture = new Texture2D(width - 1, height, TextureFormat.RGBA32, false);
         Color[] newPixels = new Color[(width - 1) * height];
 
         for (int y = 0; y < height; y++)
         {
-            int seamX = seam[y];
+            int seamX = lastVerticalSeam[y];
             int newX = 0;
             for (int x = 0; x < width; x++)
             {
@@ -146,14 +411,14 @@ public class ContentAwareResizer : MonoBehaviour
         Color[] pixels = texture.GetPixels();
 
         float[,] energyMap = CalculateEnergyMap(pixels, width, height);
-        int[] seam = FindHorizontalSeam(energyMap, width, height);
+        lastHorizontalSeam = FindHorizontalSeam(energyMap, width, height);
 
         Texture2D newTexture = new Texture2D(width, height - 1, TextureFormat.RGBA32, false);
         Color[] newPixels = new Color[width * (height - 1)];
 
         for (int x = 0; x < width; x++)
         {
-            int seamY = seam[x];
+            int seamY = lastHorizontalSeam[x];
             int newY = 0;
             for (int y = 0; y < height; y++)
             {
@@ -175,14 +440,14 @@ public class ContentAwareResizer : MonoBehaviour
         Color[] pixels = texture.GetPixels();
 
         float[,] energyMap = CalculateEnergyMap(pixels, width, height);
-        int[] seam = FindVerticalSeam(energyMap, width, height);
+        lastVerticalSeam = FindVerticalSeam(energyMap, width, height);
 
         Texture2D newTexture = new Texture2D(width + 1, height, TextureFormat.RGBA32, false);
         Color[] newPixels = new Color[(width + 1) * height];
 
         for (int y = 0; y < height; y++)
         {
-            int seamX = seam[y];
+            int seamX = lastVerticalSeam[y];
             int newX = 0;
             for (int x = 0; x < width; x++)
             {
@@ -209,14 +474,14 @@ public class ContentAwareResizer : MonoBehaviour
         Color[] pixels = texture.GetPixels();
 
         float[,] energyMap = CalculateEnergyMap(pixels, width, height);
-        int[] seam = FindHorizontalSeam(energyMap, width, height);
+        lastHorizontalSeam = FindHorizontalSeam(energyMap, width, height);
 
         Texture2D newTexture = new Texture2D(width, height + 1, TextureFormat.RGBA32, false);
         Color[] newPixels = new Color[width * (height + 1)];
 
         for (int x = 0; x < width; x++)
         {
-            int seamY = seam[x];
+            int seamY = lastHorizontalSeam[x];
             int newY = 0;
             for (int y = 0; y < height; y++)
             {
@@ -263,7 +528,7 @@ public class ContentAwareResizer : MonoBehaviour
         }
         return energyMap;
     }
-
+    
     private int[] FindVerticalSeam(float[,] energyMap, int width, int height)
     {
         float[,] M = new float[width, height];
@@ -313,7 +578,7 @@ public class ContentAwareResizer : MonoBehaviour
         }
         return seam;
     }
-
+    
     private int[] FindHorizontalSeam(float[,] energyMap, int width, int height)
     {
         float[,] M = new float[width, height];
