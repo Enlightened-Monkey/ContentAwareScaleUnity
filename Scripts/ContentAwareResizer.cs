@@ -23,9 +23,24 @@ public class ContentAwareResizer : MonoBehaviour
     void Start()
     {
         mainCamera = Camera.main;
+        if (mainCamera == null)
+        {
+            Debug.LogWarning("No main camera found. Interactive mode requires a camera tagged as 'MainCamera'.");
+        }
+        
         if (sourceTexture != null)
         {
             currentProcessedTexture = CreateReadableTextureCopy(sourceTexture);
+            if (outputRenderer != null)
+            {
+                UpdateTexture(currentProcessedTexture);
+            }
+        }
+        
+        // Ensure GameObject has a collider for interaction
+        if (enableInteractiveMode && GetComponent<Collider>() == null)
+        {
+            Debug.LogWarning("Interactive mode requires a Collider component for mouse interaction.");
         }
     }
     
@@ -39,6 +54,8 @@ public class ContentAwareResizer : MonoBehaviour
     
     private void HandleInteractiveMode()
     {
+        if (mainCamera == null) return;
+        
         // Handle mouse selection
         if (Input.GetMouseButtonDown(0))
         {
@@ -65,6 +82,17 @@ public class ContentAwareResizer : MonoBehaviour
             float scroll = Input.GetAxis("Mouse ScrollWheel");
             if (scroll != 0)
             {
+                // Prevent scaling to invalid dimensions
+                int currentWidth = currentProcessedTexture.width;
+                int currentHeight = currentProcessedTexture.height;
+                
+                if ((scroll < 0 && (currentWidth <= 2 || currentHeight <= 2)) ||
+                    (scroll > 0 && (currentWidth >= 4096 || currentHeight >= 4096)))
+                {
+                    Debug.Log("Scaling limit reached to prevent invalid dimensions");
+                    return;
+                }
+                
                 ProcessInteractiveScaling(scroll);
             }
         }
@@ -78,15 +106,7 @@ public class ContentAwareResizer : MonoBehaviour
         // Toggle seam display
         if (Input.GetKeyDown(KeyCode.S))
         {
-            showSeams = !showSeams;
-            if (showSeams && currentProcessedTexture != null)
-            {
-                ShowSeamVisualization();
-            }
-            else if (currentProcessedTexture != null)
-            {
-                UpdateTexture(currentProcessedTexture);
-            }
+            ToggleSeamDisplay();
         }
     }
     
@@ -238,6 +258,25 @@ public class ContentAwareResizer : MonoBehaviour
         }
     }
     
+    [ContextMenu("Reset to Original")]
+    public void ResetToOriginal()
+    {
+        if (sourceTexture != null)
+        {
+            currentProcessedTexture = CreateReadableTextureCopy(sourceTexture);
+            lastVerticalSeam = null;
+            lastHorizontalSeam = null;
+            
+            if (showSeams)
+            {
+                showSeams = false; // Reset seam display
+            }
+            
+            UpdateTexture(currentProcessedTexture);
+            Debug.Log("Reset texture to original dimensions: " + sourceTexture.width + "x" + sourceTexture.height);
+        }
+    }
+    
     [ContextMenu("Toggle Seam Display")]
     public void ToggleSeamDisplay()
     {
@@ -259,16 +298,28 @@ public class ContentAwareResizer : MonoBehaviour
     {
         if (enableInteractiveMode)
         {
-            // Create a simple button in the top-left corner
+            // Create buttons in the top-left corner
             if (GUI.Button(new Rect(10, 10, 120, 25), showSeams ? "Hide Seams" : "Show Seams"))
             {
                 ToggleSeamDisplay();
+            }
+            
+            if (GUI.Button(new Rect(140, 10, 100, 25), "Reset"))
+            {
+                ResetToOriginal();
             }
             
             // Display instructions
             GUI.Label(new Rect(10, 40, 300, 20), "Click and drag to move, scroll to scale");
             GUI.Label(new Rect(10, 60, 300, 20), "Hold X for X-axis only, Y for Y-axis only");
             GUI.Label(new Rect(10, 80, 300, 20), "Press S to toggle seam display");
+            
+            // Display current texture dimensions if available
+            if (currentProcessedTexture != null)
+            {
+                GUI.Label(new Rect(10, 100, 300, 20), 
+                    $"Current: {currentProcessedTexture.width}x{currentProcessedTexture.height}");
+            }
         }
     }
 
