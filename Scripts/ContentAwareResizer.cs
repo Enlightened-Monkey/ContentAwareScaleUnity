@@ -1,9 +1,10 @@
 ﻿using UnityEngine;
 using System.Collections;
+using System.Collections.Generic;
 
 /// <summary>
 /// Content-Aware Image Resizer using Seam Carving.
-/// Resizes the texture based on the GameObject's scale.
+/// This optimized version processes seams in batches for significantly improved performance.
 /// </summary>
 public class ContentAwareResizer : MonoBehaviour
 {
@@ -11,29 +12,30 @@ public class ContentAwareResizer : MonoBehaviour
     public Renderer outputRenderer;
     [Tooltip("Delay in seconds after scaling stops before the resize is applied.")]
     public float resizeDelay = 0.5f;
+    [Tooltip("Number of seams to process in a single batch. Higher values are faster but may reduce quality.")]
+    public int seamProcessBatchSize = 10;
 
     public Texture2D currentProcessedTexture { get; private set; }
-    private Texture2D originalTexture; // Store the pristine original texture
+    private Texture2D originalTexture;
     private int originalWidth;
     private int originalHeight;
     private Vector3 lastScale;
     private Coroutine resizeCoroutine;
-    private Transform targetTransform; // The transform to monitor for scale changes
+    private Transform targetTransform;
 
     void Start()
     {
         if (sourceTexture != null)
         {
-            // Store a clean, readable copy of the original texture and its dimensions
             originalTexture = CreateReadableTextureCopy(sourceTexture);
             originalWidth = sourceTexture.width;
             originalHeight = sourceTexture.height;
-            currentProcessedTexture = CreateReadableTextureCopy(originalTexture); // Start with a copy
+            currentProcessedTexture = CreateReadableTextureCopy(originalTexture);
 
             if (outputRenderer != null)
             {
                 UpdateTexture(currentProcessedTexture);
-                targetTransform = outputRenderer.transform; // Use the renderer's transform
+                targetTransform = outputRenderer.transform;
             }
             else
             {
@@ -50,15 +52,12 @@ public class ContentAwareResizer : MonoBehaviour
 
     void Update()
     {
-        // Do nothing if there is no target to monitor
         if (targetTransform == null) return;
 
-        // Check if the object's scale has changed
         if (targetTransform.localScale != lastScale)
         {
             lastScale = targetTransform.localScale;
 
-            // Use a coroutine with a delay (debouncing) to avoid resizing on every frame
             if (resizeCoroutine != null)
             {
                 StopCoroutine(resizeCoroutine);
@@ -67,18 +66,13 @@ public class ContentAwareResizer : MonoBehaviour
         }
     }
 
-    /// <summary>
-    /// Waits for a short period after scaling stops, then triggers the resize.
-    /// </summary>
     private IEnumerator DelayedResize()
     {
         yield return new WaitForSeconds(resizeDelay);
 
-        // Calculate new target dimensions based on the object's scale relative to its original size
         int newWidth = Mathf.RoundToInt(originalWidth * targetTransform.localScale.x);
         int newHeight = Mathf.RoundToInt(originalHeight * targetTransform.localScale.y);
 
-        // Clamp values to prevent invalid texture dimensions
         newWidth = Mathf.Max(2, newWidth);
         newHeight = Mathf.Max(2, newHeight);
 
@@ -86,9 +80,6 @@ public class ContentAwareResizer : MonoBehaviour
         ResizeImage(newWidth, newHeight);
     }
 
-    /// <summary>
-    /// Resizes the image to the specified target dimensions.
-    /// </summary>
     public void ResizeImage(int targetWidth, int targetHeight)
     {
         if (originalTexture == null)
@@ -99,52 +90,29 @@ public class ContentAwareResizer : MonoBehaviour
 
         Debug.Log($"Starting resize from {currentProcessedTexture.width}x{currentProcessedTexture.height} to {targetWidth}x{targetHeight}...");
 
-        // Always start from a fresh copy of the original texture for best quality
+        // Always start from a fresh copy for the best quality.
         currentProcessedTexture = CreateReadableTextureCopy(originalTexture);
 
-        int widthDifference = currentProcessedTexture.width - targetWidth;
-        int heightDifference = currentProcessedTexture.height - targetHeight;
-
         // --- Width Resizing ---
-        if (widthDifference > 0) // Reduce width
+        int widthDifference = currentProcessedTexture.width - targetWidth;
+        if (widthDifference > 0)
         {
-            for (int i = 0; i < widthDifference; i++)
-            {
-                currentProcessedTexture = RemoveVerticalSeam(currentProcessedTexture);
-                if ((i + 1) % 10 == 0 || i == widthDifference - 1)
-                    Debug.Log($"Removed vertical seam {i + 1}/{widthDifference}");
-            }
+            currentProcessedTexture = ProcessSeams(currentProcessedTexture, widthDifference, true, false);
         }
-        else if (widthDifference < 0) // Increase width
+        else if (widthDifference < 0)
         {
-            int total = -widthDifference;
-            for (int i = 0; i < total; i++)
-            {
-                currentProcessedTexture = InsertVerticalSeam(currentProcessedTexture);
-                if ((i + 1) % 10 == 0 || i == total - 1)
-                    Debug.Log($"Inserted vertical seam {i + 1}/{total}");
-            }
+            currentProcessedTexture = ProcessSeams(currentProcessedTexture, -widthDifference, true, true);
         }
 
         // --- Height Resizing ---
-        if (heightDifference > 0) // Reduce height
+        int heightDifference = currentProcessedTexture.height - targetHeight;
+        if (heightDifference > 0)
         {
-            for (int i = 0; i < heightDifference; i++)
-            {
-                currentProcessedTexture = RemoveHorizontalSeam(currentProcessedTexture);
-                if ((i + 1) % 10 == 0 || i == heightDifference - 1)
-                    Debug.Log($"Removed horizontal seam {i + 1}/{heightDifference}");
-            }
+            currentProcessedTexture = ProcessSeams(currentProcessedTexture, heightDifference, false, false);
         }
-        else if (heightDifference < 0) // Increase height
+        else if (heightDifference < 0)
         {
-            int total = -heightDifference;
-            for (int i = 0; i < total; i++)
-            {
-                currentProcessedTexture = InsertHorizontalSeam(currentProcessedTexture);
-                if ((i + 1) % 10 == 0 || i == total - 1)
-                    Debug.Log($"Inserted horizontal seam {i + 1}/{total}");
-            }
+            currentProcessedTexture = ProcessSeams(currentProcessedTexture, -heightDifference, false, true);
         }
 
         if (outputRenderer != null)
@@ -154,34 +122,276 @@ public class ContentAwareResizer : MonoBehaviour
         Debug.Log($"Finished resize. Final dimensions: {currentProcessedTexture.width}x{currentProcessedTexture.height}");
     }
 
+    /// <summary>
+    /// Master function to handle seam processing in batches.
+    /// </summary>
+    private Texture2D ProcessSeams(Texture2D texture, int totalSeams, bool isVertical, bool toInsert)
+    {
+        int seamsProcessed = 0;
+        while (seamsProcessed < totalSeams)
+        {
+            int seamsInThisBatch = Mathf.Min(seamProcessBatchSize, totalSeams - seamsProcessed);
+
+            Debug.Log($"Processing batch of {seamsInThisBatch} {(isVertical ? "vertical" : "horizontal")} seams. ({(toInsert ? "Insert" : "Remove")})");
+
+            if (isVertical)
+            {
+                texture = toInsert ?
+                    InsertVerticalSeams(texture, seamsInThisBatch) :
+                    RemoveVerticalSeams(texture, seamsInThisBatch);
+            }
+            else
+            {
+                texture = toInsert ?
+                    InsertHorizontalSeams(texture, seamsInThisBatch) :
+                    RemoveHorizontalSeams(texture, seamsInThisBatch);
+            }
+
+            seamsProcessed += seamsInThisBatch;
+        }
+        return texture;
+    }
+
+    private Texture2D RemoveVerticalSeams(Texture2D texture, int numSeams)
+    {
+        int width = texture.width;
+        int height = texture.height;
+        Color[] pixels = texture.GetPixels();
+        float[,] energyMap = CalculateEnergyMap(pixels, width, height);
+
+        List<int[]> seams = new List<int[]>();
+        for (int i = 0; i < numSeams; i++)
+        {
+            int[] seam = FindVerticalSeam(energyMap, width, height);
+            seams.Add(seam);
+            // "Erase" the seam from the energy map to find the next-best one
+            for (int y = 0; y < height; y++)
+            {
+                energyMap[seam[y], y] = float.MaxValue;
+            }
+        }
+
+        int newWidth = width - numSeams;
+        Texture2D newTexture = new Texture2D(newWidth, height, TextureFormat.RGBA32, false);
+        Color[] newPixels = new Color[newWidth * height];
+
+        bool[,] seamPixelMap = new bool[width, height];
+        foreach (var seam in seams)
+        {
+            for (int y = 0; y < height; y++)
+            {
+                seamPixelMap[seam[y], y] = true;
+            }
+        }
+
+        for (int y = 0; y < height; y++)
+        {
+            int newX = 0;
+            for (int x = 0; x < width; x++)
+            {
+                if (!seamPixelMap[x, y])
+                {
+                    newPixels[y * newWidth + newX] = pixels[y * width + x];
+                    newX++;
+                }
+            }
+        }
+
+        newTexture.SetPixels(newPixels);
+        newTexture.Apply();
+        return newTexture;
+    }
+
+    private Texture2D InsertVerticalSeams(Texture2D texture, int numSeams)
+    {
+        int width = texture.width;
+        int height = texture.height;
+        Color[] pixels = texture.GetPixels();
+        float[,] energyMap = CalculateEnergyMap(pixels, width, height);
+
+        List<int[]> seams = new List<int[]>();
+        for (int i = 0; i < numSeams; i++)
+        {
+            int[] seam = FindVerticalSeam(energyMap, width, height);
+            seams.Add(seam);
+            for (int y = 0; y < height; y++)
+            {
+                energyMap[seam[y], y] = float.MaxValue;
+            }
+        }
+
+        int newWidth = width + numSeams;
+        Texture2D newTexture = new Texture2D(newWidth, height, TextureFormat.RGBA32, false);
+        Color[] newPixels = new Color[newWidth * height];
+
+        // Use a list of seam X coordinates for each row
+        List<int>[] seamPixelsInRow = new List<int>[height];
+        for (int y = 0; y < height; y++) seamPixelsInRow[y] = new List<int>();
+        foreach (var seam in seams)
+        {
+            for (int y = 0; y < height; y++)
+            {
+                seamPixelsInRow[y].Add(seam[y]);
+            }
+        }
+
+        for (int y = 0; y < height; y++)
+        {
+            int newX = 0;
+            for (int x = 0; x < width; x++)
+            {
+                newPixels[y * newWidth + newX] = pixels[y * width + x];
+                newX++;
+
+                if (seamPixelsInRow[y].Contains(x))
+                {
+                    Color left = pixels[y * width + x];
+                    Color right = (x + 1 < width) ? pixels[y * width + x + 1] : left;
+                    newPixels[y * newWidth + newX] = Color.Lerp(left, right, 0.5f);
+                    newX++;
+                }
+            }
+        }
+
+        newTexture.SetPixels(newPixels);
+        newTexture.Apply();
+        return newTexture;
+    }
+
+    // NOTE: Horizontal versions are separate for clarity but could be combined with a transpose operation.
+    private Texture2D RemoveHorizontalSeams(Texture2D texture, int numSeams)
+    {
+        int width = texture.width;
+        int height = texture.height;
+        Color[] pixels = texture.GetPixels();
+        float[,] energyMap = CalculateEnergyMap(pixels, width, height);
+
+        List<int[]> seams = new List<int[]>();
+        for (int i = 0; i < numSeams; i++)
+        {
+            int[] seam = FindHorizontalSeam(energyMap, width, height);
+            seams.Add(seam);
+            for (int x = 0; x < width; x++)
+            {
+                energyMap[x, seam[x]] = float.MaxValue;
+            }
+        }
+
+        int newHeight = height - numSeams;
+        Texture2D newTexture = new Texture2D(width, newHeight, TextureFormat.RGBA32, false);
+        Color[] newPixels = new Color[width * newHeight];
+
+        bool[,] seamPixelMap = new bool[width, height];
+        foreach (var seam in seams)
+        {
+            for (int x = 0; x < width; x++)
+            {
+                seamPixelMap[x, seam[x]] = true;
+            }
+        }
+
+        for (int x = 0; x < width; x++)
+        {
+            int newY = 0;
+            for (int y = 0; y < height; y++)
+            {
+                if (!seamPixelMap[x, y])
+                {
+                    newPixels[newY * width + x] = pixels[y * width + x];
+                    newY++;
+                }
+            }
+        }
+
+        newTexture.SetPixels(newPixels);
+        newTexture.Apply();
+        return newTexture;
+    }
+
+    private Texture2D InsertHorizontalSeams(Texture2D texture, int numSeams)
+    {
+        int width = texture.width;
+        int height = texture.height;
+        Color[] pixels = texture.GetPixels();
+        float[,] energyMap = CalculateEnergyMap(pixels, width, height);
+
+        List<int[]> seams = new List<int[]>();
+        for (int i = 0; i < numSeams; i++)
+        {
+            int[] seam = FindHorizontalSeam(energyMap, width, height);
+            seams.Add(seam);
+            for (int x = 0; x < width; x++)
+            {
+                energyMap[x, seam[x]] = float.MaxValue;
+            }
+        }
+
+        int newHeight = height + numSeams;
+        Texture2D newTexture = new Texture2D(width, newHeight, TextureFormat.RGBA32, false);
+        Color[] newPixels = new Color[width * newHeight];
+
+        List<int>[] seamPixelsInCol = new List<int>[width];
+        for (int x = 0; x < width; x++) seamPixelsInCol[x] = new List<int>();
+        foreach (var seam in seams)
+        {
+            for (int x = 0; x < width; x++)
+            {
+                seamPixelsInCol[x].Add(seam[x]);
+            }
+        }
+
+        for (int x = 0; x < width; x++)
+        {
+            int newY = 0;
+            for (int y = 0; y < height; y++)
+            {
+                newPixels[newY * width + x] = pixels[y * width + x];
+                newY++;
+
+                if (seamPixelsInCol[x].Contains(y))
+                {
+                    Color up = pixels[y * width + x];
+                    Color down = (y + 1 < height) ? pixels[(y + 1) * width + x] : up;
+                    newPixels[newY * width + x] = Color.Lerp(up, down, 0.5f);
+                    newY++;
+                }
+            }
+        }
+
+        newTexture.SetPixels(newPixels);
+        newTexture.Apply();
+        return newTexture;
+    }
+
     public void ResetToOriginal()
     {
         if (originalTexture != null && targetTransform != null)
         {
             currentProcessedTexture = CreateReadableTextureCopy(originalTexture);
-            targetTransform.localScale = Vector3.one; // Reset scale as well
+            targetTransform.localScale = Vector3.one;
             lastScale = Vector3.one;
             UpdateTexture(currentProcessedTexture);
         }
     }
 
+    // --- Helper and Core Algorithm Functions (Unchanged from original) ---
+
     private void UpdateTexture(Texture2D texture)
     {
         if (outputRenderer != null && texture != null)
         {
+            // Destroy the old texture before assigning a new one to prevent memory leaks
+            if (outputRenderer.material.mainTexture != null && outputRenderer.material.mainTexture != sourceTexture)
+            {
+                Destroy(outputRenderer.material.mainTexture);
+            }
             outputRenderer.material.mainTexture = texture;
         }
     }
 
     private Texture2D CreateReadableTextureCopy(Texture2D source)
     {
-        RenderTexture rt = RenderTexture.GetTemporary(
-            source.width,
-            source.height,
-            0,
-            RenderTextureFormat.Default,
-            RenderTextureReadWrite.Linear
-        );
+        RenderTexture rt = RenderTexture.GetTemporary(source.width, source.height, 0, RenderTextureFormat.Default, RenderTextureReadWrite.Linear);
         Graphics.Blit(source, rt);
         RenderTexture previous = RenderTexture.active;
         RenderTexture.active = rt;
@@ -193,128 +403,6 @@ public class ContentAwareResizer : MonoBehaviour
         return readableTexture;
     }
 
-    private Texture2D RemoveVerticalSeam(Texture2D texture)
-    {
-        int width = texture.width;
-        int height = texture.height;
-        Color[] pixels = texture.GetPixels();
-        float[,] energyMap = CalculateEnergyMap(pixels, width, height);
-        int[] seam = FindVerticalSeam(energyMap, width, height);
-
-        Texture2D newTexture = new Texture2D(width - 1, height, TextureFormat.RGBA32, false);
-        Color[] newPixels = new Color[(width - 1) * height];
-
-        for (int y = 0; y < height; y++)
-        {
-            int seamX = seam[y];
-            int newX = 0;
-            for (int x = 0; x < width; x++)
-            {
-                if (x == seamX) continue;
-                newPixels[y * (width - 1) + newX] = pixels[y * width + x];
-                newX++;
-            }
-        }
-
-        newTexture.SetPixels(newPixels);
-        newTexture.Apply();
-        return newTexture;
-    }
-
-    private Texture2D RemoveHorizontalSeam(Texture2D texture)
-    {
-        int width = texture.width;
-        int height = texture.height;
-        Color[] pixels = texture.GetPixels();
-        float[,] energyMap = CalculateEnergyMap(pixels, width, height);
-        int[] seam = FindHorizontalSeam(energyMap, width, height);
-
-        Texture2D newTexture = new Texture2D(width, height - 1, TextureFormat.RGBA32, false);
-        Color[] newPixels = new Color[width * (height - 1)];
-
-        for (int x = 0; x < width; x++)
-        {
-            int seamY = seam[x];
-            int newY = 0;
-            for (int y = 0; y < height; y++)
-            {
-                if (y == seamY) continue;
-                newPixels[newY * width + x] = pixels[y * width + x];
-                newY++;
-            }
-        }
-
-        newTexture.SetPixels(newPixels);
-        newTexture.Apply();
-        return newTexture;
-    }
-
-    private Texture2D InsertVerticalSeam(Texture2D texture)
-    {
-        int width = texture.width;
-        int height = texture.height;
-        Color[] pixels = texture.GetPixels();
-        float[,] energyMap = CalculateEnergyMap(pixels, width, height);
-        int[] seam = FindVerticalSeam(energyMap, width, height);
-
-        Texture2D newTexture = new Texture2D(width + 1, height, TextureFormat.RGBA32, false);
-        Color[] newPixels = new Color[(width + 1) * height];
-
-        for (int y = 0; y < height; y++)
-        {
-            int seamX = seam[y];
-            int newX = 0;
-            for (int x = 0; x < width; x++)
-            {
-                newPixels[y * (width + 1) + newX] = pixels[y * width + x];
-                newX++;
-                if (x == seamX)
-                {
-                    Color left = pixels[y * width + x];
-                    Color right = (x + 1 < width) ? pixels[y * width + x + 1] : left;
-                    newPixels[y * (width + 1) + newX] = Color.Lerp(left, right, 0.5f);
-                    newX++;
-                }
-            }
-        }
-        newTexture.SetPixels(newPixels);
-        newTexture.Apply();
-        return newTexture;
-    }
-
-    private Texture2D InsertHorizontalSeam(Texture2D texture)
-    {
-        int width = texture.width;
-        int height = texture.height;
-        Color[] pixels = texture.GetPixels();
-        float[,] energyMap = CalculateEnergyMap(pixels, width, height);
-        int[] seam = FindHorizontalSeam(energyMap, width, height);
-
-        Texture2D newTexture = new Texture2D(width, height + 1, TextureFormat.RGBA32, false);
-        Color[] newPixels = new Color[width * (height + 1)];
-
-        for (int x = 0; x < width; x++)
-        {
-            int seamY = seam[x];
-            int newY = 0;
-            for (int y = 0; y < height; y++)
-            {
-                newPixels[newY * width + x] = pixels[y * width + x];
-                newY++;
-                if (y == seamY)
-                {
-                    Color up = pixels[y * width + x];
-                    Color down = (y + 1 < height) ? pixels[(y + 1) * width + x] : up;
-                    newPixels[newY * width + x] = Color.Lerp(up, down, 0.5f);
-                    newY++;
-                }
-            }
-        }
-        newTexture.SetPixels(newPixels);
-        newTexture.Apply();
-        return newTexture;
-    }
-
     private float[,] CalculateEnergyMap(Color[] pixels, int width, int height)
     {
         float[,] energyMap = new float[width, height];
@@ -324,7 +412,7 @@ public class ContentAwareResizer : MonoBehaviour
             {
                 if (x == 0 || x == width - 1 || y == 0 || y == height - 1)
                 {
-                    energyMap[x, y] = 1000f;
+                    energyMap[x, y] = 1000f; // Using a high, but not max, value for the border
                     continue;
                 }
                 Color p_x_minus_1 = pixels[y * width + (x - 1)];

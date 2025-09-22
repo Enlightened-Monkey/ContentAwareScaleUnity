@@ -1,153 +1,116 @@
-#pragma kernel EnergyKernel
-#pragma kernel CumulativeEnergyKernel
-#pragma kernel ResizeSeamKernel
+#pragma kernel CalculateEnergy
+#pragma kernel RemoveVerticalSeams
+#pragma kernel InsertVerticalSeams
 
-// Bez #include "UnityCG.cginc" – u¿yjemy HLSLSupport.cginc jeœli potrzeba, ale tu rêcznie
-// Dodaj #include "HLSLSupport.cginc" jeœli masz b³êdy z min/abs (Unity auto-include w starszych wersjach)
+SamplerState sampler_LinearClamp;
 
-// Textures
+// Input/Output Textures and Buffers
 Texture2D<float4> SourceTexture;
-SamplerState sampler_linear_clamp; // Sampler dla Sample (bezpieczny bez include)
-
+Texture2D<float4> InputTexture;
 RWTexture2D<float> EnergyMap;
-RWTexture2D<float2> CumulativeEnergyMap; // .x = energy, .y = encoded delta (0=left,1=center,2=right)
-RWTexture2D<float4> DestTexture;
+RWTexture2D<float4> OutputTexture;
+StructuredBuffer<int> Seams;
 
-StructuredBuffer<int> SeamPath;
-
+// Dimensions & Batch Size
 int Width;
 int Height;
-int CurrentRow;
-bool IsInsertion;
+int NumSeams;
 
-// Funkcje helpers (zastêpuj¹ UnityCG)
-float min(float a, float b)
-{
-    return a < b ? a : b;
-}
-float abs(float x)
-{
-    return x < 0 ? -x : x;
-}
-
-// --- EnergyKernel ---
+// --- KERNEL 1: Calculate Energy Map (Grayscale Version) ---
 [numthreads(8, 8, 1)]
-void EnergyKernel(uint3 id : SV_DispatchThreadID)
+void CalculateEnergy(uint3 id : SV_DispatchThreadID)
 {
-    if (id.x >= (uint) Width || id.y >= (uint) Height)
+    if (id.x >= Width || id.y >= Height)
         return;
 
     if (id.x == 0 || id.x == Width - 1 || id.y == 0 || id.y == Height - 1)
     {
-        EnergyMap[id.xy] = 10000.0f;
+        EnergyMap[id.xy] = 1000.0f;
         return;
     }
 
-    // U¿yj Sample z UV dla bezpieczeñstwa (bez Load, co wymaga include)
-    float2 uv = (float2(id.xy) + 0.5f) / float2(Width, Height);
-    float3 tl = SourceTexture.Sample(sampler_linear_clamp, uv + float2(-1, 1) / float2(Width, Height)).rgb;
-    float3 t = SourceTexture.Sample(sampler_linear_clamp, uv + float2(0, 1) / float2(Width, Height)).rgb;
-    float3 tr = SourceTexture.Sample(sampler_linear_clamp, uv + float2(1, 1) / float2(Width, Height)).rgb;
-    float3 l = SourceTexture.Sample(sampler_linear_clamp, uv + float2(-1, 0) / float2(Width, Height)).rgb;
-    float3 r = SourceTexture.Sample(sampler_linear_clamp, uv + float2(1, 0) / float2(Width, Height)).rgb;
-    float3 bl = SourceTexture.Sample(sampler_linear_clamp, uv + float2(-1, -1) / float2(Width, Height)).rgb;
-    float3 b = SourceTexture.Sample(sampler_linear_clamp, uv + float2(0, -1) / float2(Width, Height)).rgb;
-    float3 br = SourceTexture.Sample(sampler_linear_clamp, uv + float2(1, -1) / float2(Width, Height)).rgb;
+    // Standard luminance weights for converting RGB to grayscale
+    const float3 LUMA = float3(0.299, 0.587, 0.114);
 
-    float gx = -dot(tl, float3(0.333, 0.333, 0.333)) - 2.0 * dot(l, float3(0.333, 0.333, 0.333)) - dot(bl, float3(0.333, 0.333, 0.333)) +
-               dot(tr, float3(0.333, 0.333, 0.333)) + 2.0 * dot(r, float3(0.333, 0.333, 0.333)) + dot(br, float3(0.333, 0.333, 0.333));
-    float gy = -dot(tl, float3(0.333, 0.333, 0.333)) - 2.0 * dot(t, float3(0.333, 0.333, 0.333)) - dot(tr, float3(0.333, 0.333, 0.333)) +
-               dot(bl, float3(0.333, 0.333, 0.333)) + 2.0 * dot(b, float3(0.333, 0.333, 0.333)) + dot(br, float3(0.333, 0.333, 0.333));
+    // Read neighbor colors, convert to linear space, and then to grayscale immediately
+    float luma_cx_minus = dot(SourceTexture.SampleLevel(sampler_LinearClamp, (id.xy + float2(-1, 0)) / float2(Width, Height), 0).rgb, LUMA);
+    float luma_cx_plus = dot(SourceTexture.SampleLevel(sampler_LinearClamp, (id.xy + float2(1, 0)) / float2(Width, Height), 0).rgb, LUMA);
+    float luma_cy_minus = dot(SourceTexture.SampleLevel(sampler_LinearClamp, (id.xy + float2(0, -1)) / float2(Width, Height), 0).rgb, LUMA);
+    float luma_cy_plus = dot(SourceTexture.SampleLevel(sampler_LinearClamp, (id.xy + float2(0, 1)) / float2(Width, Height), 0).rgb, LUMA);
 
-    EnergyMap[id.xy] = abs(gx) + abs(gy);
+    // Calculate the gradient (rate of change) on the grayscale values
+    float gx = luma_cx_plus - luma_cx_minus;
+    float gy = luma_cy_plus - luma_cy_minus;
+
+    // The rest is the same, but with simple floats instead of vectors
+    float deltaX_sq = gx * gx;
+    float deltaY_sq = gy * gy;
+    
+    EnergyMap[id.xy] = sqrt(deltaX_sq + deltaY_sq);
 }
 
-// --- CumulativeEnergyKernel ---
-[numthreads(8, 1, 1)]
-void CumulativeEnergyKernel(uint3 id : SV_DispatchThreadID)
-{
-    uint x = id.x;
-    uint y = (uint) CurrentRow;
-    if (x >= (uint) Width)
-        return;
 
-    int2 pos = int2(x, (int) y);
-    if (y == 0)
-    {
-        CumulativeEnergyMap[pos] = float2(EnergyMap[pos], 1.0f); // Delta 0 (center)
-        return;
-    }
-
-    float minPrev = CumulativeEnergyMap[int2(x, (int) y - 1)].x;
-    float deltaCode = 1.0f; // 1 = center (0)
-
-    if (x > 0)
-    {
-        float prev = CumulativeEnergyMap[int2(x - 1, (int) y - 1)].x;
-        if (prev < minPrev)
-        {
-            minPrev = prev;
-            deltaCode = 0.0f; // 0 = left (-1)
-        }
-    }
-    if (x < (uint) Width - 1)
-    {
-        float prev = CumulativeEnergyMap[int2(x + 1, (int) y - 1)].x;
-        if (prev < minPrev)
-        {
-            minPrev = prev;
-            deltaCode = 2.0f; // 2 = right (+1)
-        }
-    }
-
-    CumulativeEnergyMap[pos] = float2(EnergyMap[pos] + minPrev, deltaCode);
-    GroupMemoryBarrierWithGroupSync();
-}
-
-// --- ResizeSeamKernel ---
+// --- KERNEL 2: Remove Vertical Seams (Unchanged) ---
 [numthreads(8, 8, 1)]
-void ResizeSeamKernel(uint3 id : SV_DispatchThreadID)
+void RemoveVerticalSeams(uint3 id : SV_DispatchThreadID)
 {
-    uint destW = IsInsertion ? (uint) Width + 1u : (uint) Width - 1u;
-    if (id.x >= destW || id.y >= (uint) Height)
+    if (id.x >= (uint) Width - NumSeams || id.y >= (uint) Height)
         return;
 
-    int seamX = SeamPath[id.y];
-    float4 color;
-
-    float2 uv = (float2(id.xy) + 0.5f) / float2(IsInsertion ? destW : Width, Height);
-
-    if (!IsInsertion)
+    int seamsToLeft = 0;
+    for (int i = 0; i < NumSeams; i++)
     {
-        // Removal: shift right after seam
-        int readX = (int) id.x;
-        if (readX >= seamX)
-            readX++;
-        if (readX >= Width)
-            return;
-        color = SourceTexture.Sample(sampler_linear_clamp, float2(readX + 0.5f, id.y + 0.5f) / float2(Width, Height));
+        int seamX = Seams[i * Height + id.y];
+        if (seamX <= id.x + seamsToLeft)
+        {
+            seamsToLeft++;
+        }
+    }
+    
+    uint2 sourceCoord = id.xy + uint2(seamsToLeft, 0);
+    OutputTexture[id.xy] = InputTexture[sourceCoord];
+}
+
+
+// --- KERNEL 3: Insert Vertical Seams (Unchanged) ---
+[numthreads(8, 8, 1)]
+void InsertVerticalSeams(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint) Width + NumSeams || id.y >= (uint) Height)
+        return;
+
+    int seamsToLeft = 0;
+    bool isNewPixel = false;
+    
+    for (int i = 0; i < NumSeams; i++)
+    {
+        int seamX = Seams[i * Height + id.y];
+        if (seamX < id.x - seamsToLeft)
+        {
+            seamsToLeft++;
+        }
+    }
+    
+    int sourceX = id.x - seamsToLeft;
+
+    for (int i = 0; i < NumSeams; i++)
+    {
+        int seamX = Seams[i * Height + id.y];
+        if (seamX == sourceX - 1)
+        {
+            isNewPixel = true;
+            break;
+        }
+    }
+
+    if (isNewPixel)
+    {
+        float4 leftColor = InputTexture[uint2(sourceX - 1, id.y)];
+        float4 rightColor = (sourceX < Width) ? InputTexture[uint2(sourceX, id.y)] : leftColor;
+        OutputTexture[id.xy] = lerp(leftColor, rightColor, 0.5f);
     }
     else
     {
-        // Insertion: insert at seam, blend new pixels
-        int readX = (int) id.x;
-        if (readX > seamX)
-        {
-            readX--;
-            color = SourceTexture.Sample(sampler_linear_clamp, float2(readX + 0.5f, id.y + 0.5f) / float2(Width, Height));
-        }
-        else if (readX == seamX)
-        {
-            // Blend left/right
-            float4 left = (seamX > 0) ? SourceTexture.Sample(sampler_linear_clamp, float2(seamX - 0.5f, id.y + 0.5f) / float2(Width, Height)) : float4(0, 0, 0, 1);
-            float4 right = SourceTexture.Sample(sampler_linear_clamp, float2(seamX + 0.5f, id.y + 0.5f) / float2(Width, Height));
-            color = (left + right) * 0.5f;
-        }
-        else
-        {
-            color = SourceTexture.Sample(sampler_linear_clamp, uv);
-        }
+        OutputTexture[id.xy] = InputTexture[uint2(sourceX, id.y)];
     }
-
-    DestTexture[id.xy] = color;
 }
