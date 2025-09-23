@@ -4,8 +4,9 @@ using System.Collections.Generic;
 using System.Linq;
 
 /// <summary>
-/// GPU-Accelerated Content-Aware Image Resizer (Optimized Batch Version).
-/// This version correctly batches seam data to minimize CPU-GPU stalls and fixes visual artifacts.
+/// GPU-Accelerated Content-Aware Image Resizer (Pixel Array Version).
+/// This version uses pixel arrays for GPU processing to ensure perfect color preservation.
+/// All texture operations are handled in C#, while GPU processes raw pixel data.
 /// </summary>
 public class GPUContentAwareResizer : MonoBehaviour
 {
@@ -40,6 +41,13 @@ public class GPUContentAwareResizer : MonoBehaviour
             energyKernel = seamCarvingShader.FindKernel("CalculateEnergy");
             removeSeamsKernel = seamCarvingShader.FindKernel("RemoveVerticalSeams");
             insertSeamsKernel = seamCarvingShader.FindKernel("InsertVerticalSeams");
+
+            // Validate that all kernels were found successfully
+            if (energyKernel < 0 || removeSeamsKernel < 0 || insertSeamsKernel < 0)
+            {
+                Debug.LogError("Failed to find one or more compute kernels in the shader!");
+                return;
+            }
 
             if (outputRenderer != null)
             {
@@ -82,7 +90,7 @@ public class GPUContentAwareResizer : MonoBehaviour
 
         Debug.Log($"Starting resize from {originalWidth}x{originalHeight} to {targetWidth}x{targetHeight}...");
 
-        RenderTexture temp = CreateRenderTexture(originalWidth, originalHeight);
+        RenderTexture temp = CreateRenderTexture(originalWidth, originalHeight, RenderTextureFormat.ARGB32);
         Graphics.Blit(originalTexture, temp);
         ReleaseRenderTexture(currentProcessedTexture);
         currentProcessedTexture = temp;
@@ -105,87 +113,244 @@ public class GPUContentAwareResizer : MonoBehaviour
         while (seamsProcessed < totalSeams)
         {
             int seamsInThisBatch = Mathf.Min(seamProcessBatchSize, totalSeams - seamsProcessed);
+            
+            // Additional safety: prevent processing more seams than the texture width/height allows
+            if (isVertical)
+            {
+                seamsInThisBatch = Mathf.Min(seamsInThisBatch, currentProcessedTexture.width - 1);
+            }
+            else
+            {
+                seamsInThisBatch = Mathf.Min(seamsInThisBatch, currentProcessedTexture.height - 1);
+            }
+            
+            if (seamsInThisBatch <= 0) break;
 
-            RenderTexture sourceTex = currentProcessedTexture;
-            if (!isVertical) sourceTex = TransposeTexture(currentProcessedTexture);
+            // Get pixels from current texture
+            Color[] sourcePixels = GetPixelsFromTexture(currentProcessedTexture);
+            int width = currentProcessedTexture.width;
+            int height = currentProcessedTexture.height;
 
-            int width = sourceTex.width;
-            int height = sourceTex.height;
+            // Handle transpose for horizontal seams
+            if (!isVertical)
+            {
+                sourcePixels = TransposePixelArray(sourcePixels, width, height);
+                int temp = width;
+                width = height;
+                height = temp;
+            }
 
-            // 1. Calculate energy map once per batch
-            float[,] energyMap = CalculateEnergyMapGPU(sourceTex);
+            // 1. Calculate energy map using pixel array
+            float[,] energyMap = CalculateEnergyMapGPU(sourcePixels, width, height);
 
             // 2. Find a batch of seams on the CPU
             List<int> allSeamData = new List<int>();
             for (int i = 0; i < seamsInThisBatch; i++)
             {
                 int[] seam = FindVerticalSeamCPU(energyMap, width, height);
-                allSeamData.AddRange(seam);
-                // Erase seam from energy map to find the next best one
-                for (int y = 0; y < height; y++) energyMap[seam[y], y] = float.MaxValue;
+                
+                // Validate seam coordinates
+                bool seamValid = true;
+                for (int y = 0; y < height; y++)
+                {
+                    if (seam[y] < 0 || seam[y] >= width)
+                    {
+                        Debug.LogError($"Invalid seam coordinate: seam[{y}] = {seam[y]}, width = {width}");
+                        seamValid = false;
+                        break;
+                    }
+                }
+                
+                if (seamValid)
+                {
+                    allSeamData.AddRange(seam);
+                    // Erase seam from energy map to find the next best one
+                    for (int y = 0; y < height; y++) energyMap[seam[y], y] = float.MaxValue;
+                }
+                else
+                {
+                    Debug.LogError("Skipping invalid seam");
+                    break;
+                }
             }
 
-            // 3. Dispatch GPU kernel once with all seam data
+            // Validate seam data
+            if (allSeamData.Count == 0)
+            {
+                Debug.LogError("No seam data to process!");
+                return;
+            }
+
+            // Debug information for large changes
+            if (seamsInThisBatch > 50)
+            {
+                Debug.Log($"Processing large batch: {seamsInThisBatch} seams, width: {width}, height: {height}");
+            }
+
+            // 3. Process seams using GPU with pixel arrays
+            Color[] resultPixels = ProcessSeamsGPU(sourcePixels, width, height, allSeamData, toInsert);
+            
+            // Calculate new dimensions
             int newWidth = toInsert ? width + seamsInThisBatch : width - seamsInThisBatch;
-            RenderTexture resultTex = CreateRenderTexture(newWidth, height);
+            newWidth = Mathf.Max(1, newWidth);
 
-            ComputeBuffer seamBuffer = new ComputeBuffer(allSeamData.Count, sizeof(int));
-            seamBuffer.SetData(allSeamData);
-
-            int kernel = toInsert ? insertSeamsKernel : removeSeamsKernel;
-            seamCarvingShader.SetTexture(kernel, "InputTexture", sourceTex);
-            seamCarvingShader.SetTexture(kernel, "OutputTexture", resultTex);
-            seamCarvingShader.SetBuffer(kernel, "Seams", seamBuffer);
-            seamCarvingShader.SetInt("Width", width);
-            seamCarvingShader.SetInt("Height", height);
-            seamCarvingShader.SetInt("NumSeams", seamsInThisBatch);
-
-            seamCarvingShader.Dispatch(kernel, Mathf.CeilToInt(newWidth / 8.0f), Mathf.CeilToInt(height / 8.0f), 1);
-
-            seamBuffer.Release();
-
+            // Handle transpose back for horizontal seams
             if (!isVertical)
             {
-                ReleaseRenderTexture(sourceTex); // release transposed source
-                currentProcessedTexture = TransposeTexture(resultTex);
-                ReleaseRenderTexture(resultTex); // release intermediate result
+                resultPixels = TransposePixelArray(resultPixels, newWidth, height);
+                int temp = newWidth;
+                newWidth = height;
+                height = temp;
             }
-            else
-            {
-                currentProcessedTexture = resultTex;
-            }
+
+            // Convert result back to texture
+            ReleaseRenderTexture(currentProcessedTexture);
+            currentProcessedTexture = CreateTextureFromPixels(resultPixels, newWidth, height);
 
             seamsProcessed += seamsInThisBatch;
         }
     }
 
-    // --- GPU INTERACTION & CPU ALGORITHM (MOSTLY UNCHANGED) ---
-    // NOTE: TransposeTexture is still a slow CPU implementation. For max performance, it should be a compute shader.
-    private float[,] CalculateEnergyMapGPU(RenderTexture source)
+    // --- GPU INTERACTION WITH PIXEL ARRAYS ---
+    private float[,] CalculateEnergyMapGPU(Color[] pixels, int width, int height)
     {
-        int width = source.width;
-        int height = source.height;
-        RenderTexture energyMapRT = CreateRenderTexture(width, height, RenderTextureFormat.RFloat);
+        // Convert Color[] to float4 array for GPU
+        Vector4[] pixelData = new Vector4[pixels.Length];
+        for (int i = 0; i < pixels.Length; i++)
+        {
+            pixelData[i] = new Vector4(pixels[i].r, pixels[i].g, pixels[i].b, pixels[i].a);
+        }
 
-        seamCarvingShader.SetTexture(energyKernel, "SourceTexture", source);
-        seamCarvingShader.SetTexture(energyKernel, "EnergyMap", energyMapRT);
+        // Create buffers
+        ComputeBuffer inputBuffer = new ComputeBuffer(pixels.Length, sizeof(float) * 4);
+        ComputeBuffer energyBuffer = new ComputeBuffer(pixels.Length, sizeof(float));
+        
+        inputBuffer.SetData(pixelData);
+
+        // Set up compute shader
+        seamCarvingShader.SetBuffer(energyKernel, "InputPixels", inputBuffer);
+        seamCarvingShader.SetBuffer(energyKernel, "EnergyMap", energyBuffer);
         seamCarvingShader.SetInt("Width", width);
         seamCarvingShader.SetInt("Height", height);
-        seamCarvingShader.Dispatch(energyKernel, Mathf.CeilToInt(width / 8.0f), Mathf.CeilToInt(height / 8.0f), 1);
+        
+        // Dispatch compute shader
+        int totalPixels = width * height;
+        int threadGroups = Mathf.CeilToInt(totalPixels / 64.0f);
+        seamCarvingShader.Dispatch(energyKernel, threadGroups, 1, 1);
 
-        Texture2D tempTex = new Texture2D(width, height, TextureFormat.RFloat, false);
-        RenderTexture.active = energyMapRT;
-        tempTex.ReadPixels(new Rect(0, 0, width, height), 0, 0);
+        // Get results
+        float[] energyData = new float[pixels.Length];
+        energyBuffer.GetData(energyData);
+
+        // Convert to 2D array
+        float[,] energyMap = new float[width, height];
+        for (int y = 0; y < height; y++)
+        {
+            for (int x = 0; x < width; x++)
+            {
+                energyMap[x, y] = energyData[y * width + x];
+            }
+        }
+
+        // Cleanup
+        inputBuffer.Release();
+        energyBuffer.Release();
+
+        return energyMap;
+    }
+
+    private Color[] ProcessSeamsGPU(Color[] inputPixels, int width, int height, List<int> seamData, bool toInsert)
+    {
+        int seamCount = seamData.Count / height;
+        int newWidth = toInsert ? width + seamCount : width - seamCount;
+        int outputSize = newWidth * height;
+
+        // Convert input to Vector4 array
+        Vector4[] inputData = new Vector4[inputPixels.Length];
+        for (int i = 0; i < inputPixels.Length; i++)
+        {
+            inputData[i] = new Vector4(inputPixels[i].r, inputPixels[i].g, inputPixels[i].b, inputPixels[i].a);
+        }
+
+        // Create buffers
+        ComputeBuffer inputBuffer = new ComputeBuffer(inputPixels.Length, sizeof(float) * 4);
+        ComputeBuffer outputBuffer = new ComputeBuffer(outputSize, sizeof(float) * 4);
+        ComputeBuffer seamBuffer = new ComputeBuffer(seamData.Count, sizeof(int));
+
+        inputBuffer.SetData(inputData);
+        seamBuffer.SetData(seamData.ToArray());
+
+        // Select kernel
+        int kernel = toInsert ? insertSeamsKernel : removeSeamsKernel;
+
+        // Set up compute shader
+        seamCarvingShader.SetBuffer(kernel, "InputPixels", inputBuffer);
+        seamCarvingShader.SetBuffer(kernel, "OutputPixels", outputBuffer);
+        seamCarvingShader.SetBuffer(kernel, "Seams", seamBuffer);
+        seamCarvingShader.SetInt("Width", width);
+        seamCarvingShader.SetInt("Height", height);
+        seamCarvingShader.SetInt("NumSeams", seamCount);
+
+        // Dispatch
+        int threadGroups = Mathf.CeilToInt(outputSize / 64.0f);
+        seamCarvingShader.Dispatch(kernel, threadGroups, 1, 1);
+
+        // Get results
+        Vector4[] outputData = new Vector4[outputSize];
+        outputBuffer.GetData(outputData);
+
+        // Convert back to Color array
+        Color[] outputPixels = new Color[outputSize];
+        for (int i = 0; i < outputSize; i++)
+        {
+            outputPixels[i] = new Color(outputData[i].x, outputData[i].y, outputData[i].z, outputData[i].w);
+        }
+
+        // Cleanup
+        inputBuffer.Release();
+        outputBuffer.Release();
+        seamBuffer.Release();
+
+        return outputPixels;
+    }
+
+    private Color[] GetPixelsFromTexture(RenderTexture texture)
+    {
+        Texture2D tempTex = new Texture2D(texture.width, texture.height, TextureFormat.RGBA32, false);
+        RenderTexture.active = texture;
+        tempTex.ReadPixels(new Rect(0, 0, texture.width, texture.height), 0, 0);
         tempTex.Apply();
         RenderTexture.active = null;
 
         Color[] pixels = tempTex.GetPixels();
-        float[,] energyMap = new float[width, height];
-        for (int y = 0; y < height; y++) for (int x = 0; x < width; x++) energyMap[x, y] = pixels[y * width + x].r;
-
         Destroy(tempTex);
-        ReleaseRenderTexture(energyMapRT);
-        return energyMap;
+        return pixels;
+    }
+
+    private RenderTexture CreateTextureFromPixels(Color[] pixels, int width, int height)
+    {
+        Texture2D tempTex = new Texture2D(width, height, TextureFormat.RGBA32, false);
+        tempTex.SetPixels(pixels);
+        tempTex.Apply();
+
+        RenderTexture result = CreateRenderTexture(width, height, RenderTextureFormat.ARGB32);
+        Graphics.Blit(tempTex, result);
+        
+        Destroy(tempTex);
+        return result;
+    }
+
+    private Color[] TransposePixelArray(Color[] pixels, int width, int height)
+    {
+        Color[] transposed = new Color[pixels.Length];
+        for (int y = 0; y < height; y++)
+        {
+            for (int x = 0; x < width; x++)
+            {
+                transposed[x * height + y] = pixels[y * width + x];
+            }
+        }
+        return transposed;
     }
 
     private int[] FindVerticalSeamCPU(float[,] energyMap, int width, int height)
@@ -214,26 +379,7 @@ public class GPUContentAwareResizer : MonoBehaviour
         return seam;
     }
 
-    private RenderTexture TransposeTexture(RenderTexture source)
-    {
-        int width = source.width;
-        int height = source.height;
-        RenderTexture transposed = CreateRenderTexture(height, width);
-        Texture2D tempTex = new Texture2D(width, height, TextureFormat.RGBA32, false);
-        RenderTexture.active = source;
-        tempTex.ReadPixels(new Rect(0, 0, width, height), 0, 0);
-        RenderTexture.active = null;
-        Color32[] pixels = tempTex.GetPixels32();
-        Color32[] newPixels = new Color32[pixels.Length];
-        for (int x = 0; x < width; x++) for (int y = 0; y < height; y++) newPixels[x * height + y] = pixels[y * width + x];
-        Texture2D newTempTex = new Texture2D(height, width);
-        newTempTex.SetPixels32(newPixels);
-        newTempTex.Apply();
-        Graphics.Blit(newTempTex, transposed);
-        Destroy(tempTex);
-        Destroy(newTempTex);
-        return transposed;
-    }
+
 
     // --- UTILITY FUNCTIONS ---
 
@@ -248,8 +394,8 @@ public class GPUContentAwareResizer : MonoBehaviour
             source.width,
             source.height,
             0,
-            RenderTextureFormat.Default,
-            RenderTextureReadWrite.Linear
+            RenderTextureFormat.ARGB32, // Use ARGB32 for better color preservation
+            RenderTextureReadWrite.sRGB // Use sRGB for proper color space handling
         );
 
         // Copy the source texture data to the RenderTexture.
@@ -281,7 +427,9 @@ public class GPUContentAwareResizer : MonoBehaviour
     /// </summary>
     private RenderTexture CreateRenderTexture(int width, int height, RenderTextureFormat format = RenderTextureFormat.Default)
     {
-        RenderTexture rt = new RenderTexture(width, height, 24, format);
+        // Use ARGB32 for better color preservation when format is Default
+        RenderTextureFormat actualFormat = (format == RenderTextureFormat.Default) ? RenderTextureFormat.ARGB32 : format;
+        RenderTexture rt = new RenderTexture(width, height, 0, actualFormat); // Reduced depth buffer from 24 to 0 for color textures
         // This flag is crucial! It allows a compute shader to write data to this texture.
         rt.enableRandomWrite = true;
         rt.Create(); // Actually create the GPU resource.

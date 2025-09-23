@@ -2,13 +2,10 @@
 #pragma kernel RemoveVerticalSeams
 #pragma kernel InsertVerticalSeams
 
-SamplerState sampler_LinearClamp;
-
-// Input/Output Textures and Buffers
-Texture2D<float4> SourceTexture;
-Texture2D<float4> InputTexture;
-RWTexture2D<float> EnergyMap;
-RWTexture2D<float4> OutputTexture;
+// Input/Output Pixel Arrays and Buffers
+StructuredBuffer<float4> InputPixels;
+RWStructuredBuffer<float> EnergyMap;
+RWStructuredBuffer<float4> OutputPixels;
 StructuredBuffer<int> Seams;
 
 // Dimensions & Batch Size
@@ -16,101 +13,194 @@ int Width;
 int Height;
 int NumSeams;
 
-// --- KERNEL 1: Calculate Energy Map (Grayscale Version) ---
-[numthreads(8, 8, 1)]
+// --- KERNEL 1: Calculate Energy Map (RGB Version) ---
+[numthreads(64, 1, 1)]
 void CalculateEnergy(uint3 id : SV_DispatchThreadID)
 {
-    if (id.x >= Width || id.y >= Height)
+    uint index = id.x;
+    if (index >= (uint)(Width * Height))
         return;
 
-    if (id.x == 0 || id.x == Width - 1 || id.y == 0 || id.y == Height - 1)
+    uint x = index % (uint)Width;
+    uint y = index / (uint)Width;
+
+    // Check if current pixel is transparent
+    float4 currentPixel = InputPixels[index];
+    if (currentPixel.a < 0.01f)
     {
-        EnergyMap[id.xy] = 1000.0f;
+        // Transparent pixels have very low energy to be preserved
+        EnergyMap[index] = 0.1f;
         return;
     }
 
-    // Standard luminance weights for converting RGB to grayscale
-    const float3 LUMA = float3(0.299, 0.587, 0.114);
+    if (x == 0 || x == (uint)Width - 1 || y == 0 || y == (uint)Height - 1)
+    {
+        EnergyMap[index] = 1000.0f;
+        return;
+    }
 
-    // Read neighbor colors, convert to linear space, and then to grayscale immediately
-    float luma_cx_minus = dot(SourceTexture.SampleLevel(sampler_LinearClamp, (id.xy + float2(-1, 0)) / float2(Width, Height), 0).rgb, LUMA);
-    float luma_cx_plus = dot(SourceTexture.SampleLevel(sampler_LinearClamp, (id.xy + float2(1, 0)) / float2(Width, Height), 0).rgb, LUMA);
-    float luma_cy_minus = dot(SourceTexture.SampleLevel(sampler_LinearClamp, (id.xy + float2(0, -1)) / float2(Width, Height), 0).rgb, LUMA);
-    float luma_cy_plus = dot(SourceTexture.SampleLevel(sampler_LinearClamp, (id.xy + float2(0, 1)) / float2(Width, Height), 0).rgb, LUMA);
+    // Get neighbor pixel indices
+    uint idx_cx_minus = y * (uint)Width + (x - 1);
+    uint idx_cx_plus = y * (uint)Width + (x + 1);
+    uint idx_cy_minus = (y - 1) * (uint)Width + x;
+    uint idx_cy_plus = (y + 1) * (uint)Width + x;
 
-    // Calculate the gradient (rate of change) on the grayscale values
-    float gx = luma_cx_plus - luma_cx_minus;
-    float gy = luma_cy_plus - luma_cy_minus;
+    // Read neighbor colors from pixel array
+    float4 color_cx_minus = InputPixels[idx_cx_minus];
+    float4 color_cx_plus = InputPixels[idx_cx_plus];
+    float4 color_cy_minus = InputPixels[idx_cy_minus];
+    float4 color_cy_plus = InputPixels[idx_cy_plus];
 
-    // The rest is the same, but with simple floats instead of vectors
-    float deltaX_sq = gx * gx;
-    float deltaY_sq = gy * gy;
+    // For transparent sprites, we need to consider alpha in energy calculation
+    // Calculate RGB gradients
+    float3 gx_rgb = color_cx_plus.rgb - color_cx_minus.rgb;
+    float3 gy_rgb = color_cy_plus.rgb - color_cy_minus.rgb;
     
-    EnergyMap[id.xy] = sqrt(deltaX_sq + deltaY_sq);
+    // Calculate alpha gradients (important for transparent sprites)
+    float gx_alpha = color_cx_plus.a - color_cx_minus.a;
+    float gy_alpha = color_cy_plus.a - color_cy_minus.a;
+
+    // Calculate energy using RGB channels + alpha channel for transparency awareness
+    float deltaX_sq = dot(gx_rgb, gx_rgb) + (gx_alpha * gx_alpha);
+    float deltaY_sq = dot(gy_rgb, gy_rgb) + (gy_alpha * gy_alpha);
+    
+    float energy = sqrt(deltaX_sq + deltaY_sq);
+    
+    // Boost energy at alpha boundaries (edges between transparent and opaque areas)
+    float alphaVariation = abs(gx_alpha) + abs(gy_alpha);
+    if (alphaVariation > 0.1f)
+    {
+        energy += alphaVariation * 500.0f; // High energy at transparency boundaries
+    }
+    
+    EnergyMap[index] = energy;
 }
 
 
-// --- KERNEL 2: Remove Vertical Seams (Unchanged) ---
-[numthreads(8, 8, 1)]
+// --- KERNEL 2: Remove Vertical Seams ---
+[numthreads(64, 1, 1)]
 void RemoveVerticalSeams(uint3 id : SV_DispatchThreadID)
 {
-    if (id.x >= (uint) Width - NumSeams || id.y >= (uint) Height)
+    uint outputIndex = id.x;
+    uint newWidth = (uint)Width - (uint)NumSeams;
+    
+    if (outputIndex >= newWidth * (uint)Height)
         return;
 
+    uint outputX = outputIndex % newWidth;
+    uint outputY = outputIndex / newWidth;
+
+    // Count how many seams are to the left of this output pixel
     int seamsToLeft = 0;
     for (int i = 0; i < NumSeams; i++)
     {
-        int seamX = Seams[i * Height + id.y];
-        if (seamX <= id.x + seamsToLeft)
+        int bufferIndex = i * Height + (int)outputY;
+        if (bufferIndex >= 0 && bufferIndex < NumSeams * Height)
         {
-            seamsToLeft++;
+            int seamX = Seams[bufferIndex];
+            if (seamX <= (int)outputX + seamsToLeft)
+            {
+                seamsToLeft++;
+            }
         }
     }
     
-    uint2 sourceCoord = id.xy + uint2(seamsToLeft, 0);
-    OutputTexture[id.xy] = InputTexture[sourceCoord];
-}
-
-
-// --- KERNEL 3: Insert Vertical Seams (Unchanged) ---
-[numthreads(8, 8, 1)]
-void InsertVerticalSeams(uint3 id : SV_DispatchThreadID)
-{
-    if (id.x >= (uint) Width + NumSeams || id.y >= (uint) Height)
-        return;
-
-    int seamsToLeft = 0;
-    bool isNewPixel = false;
+    // Calculate source coordinate in the original (wider) image
+    uint sourceX = outputX + (uint)seamsToLeft;
+    uint sourceIndex = outputY * (uint)Width + sourceX;
     
-    for (int i = 0; i < NumSeams; i++)
+    // Bounds check and copy pixel
+    if (sourceX < (uint)Width && sourceIndex < (uint)(Width * Height))
     {
-        int seamX = Seams[i * Height + id.y];
-        if (seamX < id.x - seamsToLeft)
-        {
-            seamsToLeft++;
-        }
-    }
-    
-    int sourceX = id.x - seamsToLeft;
-
-    for (int i = 0; i < NumSeams; i++)
-    {
-        int seamX = Seams[i * Height + id.y];
-        if (seamX == sourceX - 1)
-        {
-            isNewPixel = true;
-            break;
-        }
-    }
-
-    if (isNewPixel)
-    {
-        float4 leftColor = InputTexture[uint2(sourceX - 1, id.y)];
-        float4 rightColor = (sourceX < Width) ? InputTexture[uint2(sourceX, id.y)] : leftColor;
-        OutputTexture[id.xy] = lerp(leftColor, rightColor, 0.5f);
+        OutputPixels[outputIndex] = InputPixels[sourceIndex];
     }
     else
     {
-        OutputTexture[id.xy] = InputTexture[uint2(sourceX, id.y)];
+        // Use transparent black for out of bounds (preserves transparency)
+        OutputPixels[outputIndex] = float4(0, 0, 0, 0);
+    }
+}
+
+
+// --- KERNEL 3: Insert Vertical Seams ---
+[numthreads(64, 1, 1)]
+void InsertVerticalSeams(uint3 id : SV_DispatchThreadID)
+{
+    uint outputIndex = id.x;
+    uint newWidth = (uint)Width + (uint)NumSeams;
+    
+    if (outputIndex >= newWidth * (uint)Height)
+        return;
+
+    uint outputX = outputIndex % newWidth;
+    uint outputY = outputIndex / newWidth;
+
+    // Count seams that should cause an insertion before this output position
+    int seamsToLeft = 0;
+    bool isNewPixel = false;
+    int sourceX = (int)outputX;
+    
+    for (int i = 0; i < NumSeams; i++)
+    {
+        int bufferIndex = i * Height + (int)outputY;
+        if (bufferIndex >= 0 && bufferIndex < NumSeams * Height)
+        {
+            int seamX = Seams[bufferIndex];
+            
+            // Adjust seamX based on previously inserted seams
+            int adjustedSeamX = seamX;
+            for (int j = 0; j < i; j++)
+            {
+                int otherBufferIndex = j * Height + (int)outputY;
+                if (otherBufferIndex >= 0 && otherBufferIndex < NumSeams * Height)
+                {
+                    int otherSeamX = Seams[otherBufferIndex];
+                    if (otherSeamX <= seamX)
+                    {
+                        adjustedSeamX++;
+                    }
+                }
+            }
+            
+            if (adjustedSeamX < (int)outputX)
+            {
+                seamsToLeft++;
+            }
+            else if (adjustedSeamX == (int)outputX)
+            {
+                isNewPixel = true;
+                sourceX = seamX;
+                break;
+            }
+        }
+    }
+    
+    if (!isNewPixel)
+    {
+        sourceX = (int)outputX - seamsToLeft;
+    }
+    
+    // Bounds check for source position
+    if (sourceX < 0 || sourceX >= Width)
+    {
+        OutputPixels[outputIndex] = float4(0, 0, 0, 1);
+        return;
+    }
+    
+    if (isNewPixel)
+    {
+        // Interpolate between the seam pixel and its right neighbor
+        uint leftIndex = outputY * (uint)Width + (uint)sourceX;
+        uint rightIndex = (sourceX + 1 < Width) ? (outputY * (uint)Width + (uint)(sourceX + 1)) : leftIndex;
+        
+        float4 leftColor = InputPixels[leftIndex];
+        float4 rightColor = InputPixels[rightIndex];
+        OutputPixels[outputIndex] = (leftColor + rightColor) * 0.5f;
+    }
+    else
+    {
+        // Copy existing pixel
+        uint sourceIndex = outputY * (uint)Width + (uint)sourceX;
+        OutputPixels[outputIndex] = InputPixels[sourceIndex];
     }
 }
